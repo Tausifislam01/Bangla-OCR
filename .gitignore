@@ -30,3 +30,6 @@ Thumbs.db
 
 !models/model.keras
 !labels.json
+
+mlflow.db
+artifacts/mlflow_artifacts/
