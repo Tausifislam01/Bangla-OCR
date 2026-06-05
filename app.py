@@ -75,7 +75,347 @@ def preprocess_character(character_image):
     return character_image
 
 
-def segment_characters(canvas_image):
+def make_square_image(character_image, padding=30):
+    h, w = character_image.shape
+
+    square_size = max(w, h) + padding
+    square_image = np.zeros((square_size, square_size), dtype=np.uint8)
+
+    x_offset = (square_size - w) // 2
+    y_offset = (square_size - h) // 2
+
+    square_image[
+        y_offset:y_offset + h,
+        x_offset:x_offset + w
+    ] = character_image
+
+    return square_image
+
+
+def crop_to_ink(image):
+    coords = cv2.findNonZero(image)
+
+    if coords is None:
+        return None, None
+
+    x, y, w, h = cv2.boundingRect(coords)
+
+    if w < 4 or h < 4:
+        return None, None
+
+    cropped = image[y:y + h, x:x + w]
+    box = (x, y, w, h)
+
+    return cropped, box
+
+
+def get_gap_ranges(gap_columns, minimum_gap_width=3):
+    gap_ranges = []
+    start = None
+
+    for i, is_gap in enumerate(gap_columns):
+        if is_gap and start is None:
+            start = i
+        elif not is_gap and start is not None:
+            if i - start >= minimum_gap_width:
+                gap_ranges.append((start, i))
+            start = None
+
+    if start is not None and len(gap_columns) - start >= minimum_gap_width:
+        gap_ranges.append((start, len(gap_columns)))
+
+    return gap_ranges
+
+
+def estimate_matra_band(word_image):
+    h, w = word_image.shape
+
+    if h < 20 or w < 20:
+        return None
+
+    horizontal_projection = np.sum(word_image > 0, axis=1).astype(np.float32)
+
+    if np.max(horizontal_projection) == 0:
+        return None
+
+    upper_limit = max(1, int(h * 0.45))
+    upper_projection = horizontal_projection[:upper_limit]
+
+    matra_y = int(np.argmax(upper_projection))
+    matra_strength = upper_projection[matra_y]
+
+    if matra_strength < 0.25 * w:
+        return None
+
+    band_top = max(0, matra_y - 2)
+    band_bottom = min(h, matra_y + 5)
+
+    return band_top, band_bottom
+
+
+def remove_matra_for_segmentation(word_image):
+    segmentation_image = word_image.copy()
+
+    matra_band = estimate_matra_band(word_image)
+
+    if matra_band is None:
+        return segmentation_image, None
+
+    band_top, band_bottom = matra_band
+
+    segmentation_image[band_top:band_bottom, :] = 0
+
+    return segmentation_image, matra_band
+
+
+def safe_vertical_cuts_from_projection(segmentation_image, expected_count=None):
+    h, w = segmentation_image.shape
+
+    if w < 25:
+        return []
+
+    projection = np.sum(segmentation_image > 0, axis=0).astype(np.float32)
+
+    if len(projection) == 0 or np.max(projection) == 0:
+        return []
+
+    kernel_size = 7
+    kernel = np.ones(kernel_size) / kernel_size
+    smooth_projection = np.convolve(projection, kernel, mode="same")
+
+    max_projection = np.max(smooth_projection)
+
+    gap_threshold = max(1, 0.10 * max_projection)
+    gap_columns = smooth_projection <= gap_threshold
+
+    gap_ranges = get_gap_ranges(
+        gap_columns,
+        minimum_gap_width=3
+    )
+
+    candidate_cuts = []
+
+    for gap_start, gap_end in gap_ranges:
+        midpoint = (gap_start + gap_end) // 2
+
+        if 8 < midpoint < w - 8:
+            candidate_cuts.append(midpoint)
+
+    candidate_cuts = sorted(candidate_cuts)
+
+    if expected_count is not None and expected_count <= 1:
+        return []
+
+    if expected_count is None:
+        return candidate_cuts
+
+    required_cuts = expected_count - 1
+
+    if required_cuts <= 0:
+        return []
+
+    if len(candidate_cuts) <= required_cuts:
+        return candidate_cuts
+
+    selected_cuts = []
+
+    for i in range(1, expected_count):
+        ideal_cut = int((w * i) / expected_count)
+
+        available_cuts = [
+            cut for cut in candidate_cuts
+            if cut not in selected_cuts
+        ]
+
+        if len(available_cuts) == 0:
+            break
+
+        nearest_cut = min(
+            available_cuts,
+            key=lambda cut: abs(cut - ideal_cut)
+        )
+
+        max_distance = w / expected_count * 0.55
+
+        if abs(nearest_cut - ideal_cut) <= max_distance:
+            selected_cuts.append(nearest_cut)
+
+    return sorted(selected_cuts)
+
+
+def build_segments_from_cuts(word_image, cut_points, word_x, word_y):
+    h, w = word_image.shape
+
+    raw_segments = []
+    previous_x = 0
+
+    for cut_x in cut_points + [w]:
+        segment_x1 = previous_x
+        segment_x2 = cut_x
+        previous_x = cut_x
+
+        if segment_x2 - segment_x1 < 6:
+            continue
+
+        segment = word_image[:, segment_x1:segment_x2]
+
+        cropped, local_box = crop_to_ink(segment)
+
+        if cropped is None:
+            continue
+
+        sx, sy, sw, sh = local_box
+
+        if sw < 4 or sh < 6:
+            continue
+
+        ink_area = cv2.countNonZero(cropped)
+
+        if ink_area < 15:
+            continue
+
+        global_box = (
+            word_x + segment_x1 + sx,
+            word_y + sy,
+            sw,
+            sh
+        )
+
+        raw_segments.append((cropped, global_box))
+
+    raw_segments = sorted(raw_segments, key=lambda item: item[1][0])
+
+    return raw_segments
+
+
+def whole_image_as_single_segment(binary):
+    cropped, box = crop_to_ink(binary)
+
+    if cropped is None:
+        return []
+
+    x, y, w, h = box
+
+    if w < 4 or h < 4:
+        return []
+
+    return [(cropped, box)]
+
+
+def matra_aware_segmentation(binary, expected_count=None):
+    coords = cv2.findNonZero(binary)
+
+    if coords is None:
+        return []
+
+    word_x, word_y, word_w, word_h = cv2.boundingRect(coords)
+
+    if word_w < 4 or word_h < 4:
+        return []
+
+    word_image = binary[word_y:word_y + word_h, word_x:word_x + word_w]
+
+    if expected_count is not None and expected_count <= 1:
+        return [(word_image, (word_x, word_y, word_w, word_h))]
+
+    segmentation_image, matra_band = remove_matra_for_segmentation(word_image)
+
+    cut_points = safe_vertical_cuts_from_projection(
+        segmentation_image,
+        expected_count=expected_count
+    )
+
+    raw_segments = build_segments_from_cuts(
+        word_image,
+        cut_points,
+        word_x,
+        word_y
+    )
+
+    if len(raw_segments) == 0:
+        raw_segments = [(word_image, (word_x, word_y, word_w, word_h))]
+
+    return raw_segments
+
+
+def contour_based_segmentation(binary):
+    contours, _ = cv2.findContours(
+        binary,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    boxes = []
+
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        area = cv2.contourArea(contour)
+
+        if w >= 6 and h >= 8 and area >= 20:
+            boxes.append((x, y, w, h))
+
+    boxes = sorted(boxes, key=lambda item: item[0])
+
+    raw_segments = []
+
+    for x, y, w, h in boxes:
+        character = binary[y:y + h, x:x + w]
+        raw_segments.append((character, (x, y, w, h)))
+
+    return raw_segments
+
+
+def is_matra_only_segment(segment, box):
+    x, y, w, h = box
+    ink_area = cv2.countNonZero(segment)
+
+    if w == 0 or h == 0:
+        return True
+
+    aspect_ratio = w / h
+
+    if h <= 14 and aspect_ratio >= 2.0:
+        return True
+
+    if ink_area < 30:
+        return True
+
+    horizontal_projection = np.sum(segment > 0, axis=1)
+
+    if len(horizontal_projection) > 0:
+        max_row_ink = np.max(horizontal_projection)
+
+        if max_row_ink > 0.60 * w and h <= 18:
+            return True
+
+    return False
+
+
+def merge_tiny_components(segments):
+    if len(segments) <= 1:
+        return segments
+
+    cleaned_segments = []
+
+    for segment, box in segments:
+        x, y, w, h = box
+        area = cv2.countNonZero(segment)
+
+        if w < 5 or h < 5 or area < 20:
+            continue
+
+        if is_matra_only_segment(segment, box):
+            continue
+
+        cleaned_segments.append((segment, box))
+
+    if len(cleaned_segments) == 0:
+        return segments
+
+    return sorted(cleaned_segments, key=lambda item: item[1][0])
+
+
+def segment_characters(canvas_image, expected_count=None, use_expected_count=True):
     gray = cv2.cvtColor(canvas_image, cv2.COLOR_RGBA2GRAY)
 
     _, binary = cv2.threshold(
@@ -91,39 +431,30 @@ def segment_characters(canvas_image):
     dilate_kernel = np.ones((2, 2), np.uint8)
     binary = cv2.dilate(binary, dilate_kernel, iterations=1)
 
-    contours, _ = cv2.findContours(
-        binary,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE
-    )
+    effective_expected_count = expected_count if use_expected_count else None
 
-    boxes = []
+    if effective_expected_count is not None and effective_expected_count <= 1:
+        raw_segments = whole_image_as_single_segment(binary)
+    else:
+        raw_segments = matra_aware_segmentation(
+            binary,
+            expected_count=effective_expected_count
+        )
 
-    for contour in contours:
-        x, y, w, h = cv2.boundingRect(contour)
+    if len(raw_segments) == 0:
+        raw_segments = contour_based_segmentation(binary)
 
-        if w >= 8 and h >= 8:
-            boxes.append((x, y, w, h))
+    raw_segments = merge_tiny_components(raw_segments)
 
-    boxes = sorted(boxes, key=lambda item: item[0])
+    raw_segments = sorted(raw_segments, key=lambda item: item[1][0])
 
     character_images = []
+    boxes = []
 
-    for x, y, w, h in boxes:
-        character = binary[y:y + h, x:x + w]
-
-        square_size = max(w, h) + 30
-        square_image = np.zeros((square_size, square_size), dtype=np.uint8)
-
-        x_offset = (square_size - w) // 2
-        y_offset = (square_size - h) // 2
-
-        square_image[
-            y_offset:y_offset + h,
-            x_offset:x_offset + w
-        ] = character
-
+    for cropped_character, box in raw_segments:
+        square_image = make_square_image(cropped_character, padding=30)
         character_images.append(square_image)
+        boxes.append(box)
 
     return character_images, boxes, binary
 
@@ -138,13 +469,12 @@ def predict_character(model, labels, character_map, character_image):
 
     best_index = int(np.argmax(probabilities))
 
-    # labels.json maps model output index to dataset folder ID, for example:
-    # "41" -> "42"
     dataset_class_id = labels.get(str(best_index), str(best_index))
 
-    # character_map.json maps dataset folder ID to Bangla Unicode character, for example:
-    # "42" -> "স"
-    bangla_character = character_map.get(str(dataset_class_id), str(dataset_class_id))
+    bangla_character = character_map.get(
+        str(dataset_class_id),
+        str(dataset_class_id)
+    )
 
     confidence = float(probabilities[best_index])
 
@@ -171,9 +501,9 @@ def main():
     st.title("Bangla Handwritten Word Recognition System")
 
     st.write(
-        "Draw a Bangla word or separated Bangla characters on the canvas. "
-        "The system segments the drawing into character regions, predicts each "
-        "character using the trained CNN model, and combines the predictions."
+        "Draw a Bangla character, jukto borno, or word on the canvas. "
+        "The system segments the drawing into safe base/jukto units, predicts each "
+        "unit using the trained CNN model, and combines the predictions."
     )
 
     model = load_model()
@@ -193,11 +523,39 @@ def main():
         else:
             st.write("Character mapping not found. Showing numeric class IDs.")
 
+        st.header("Segmentation Settings")
+
+        use_expected_count = st.checkbox(
+            "Use expected base/jukto unit count",
+            value=True,
+            help=(
+                "Turn this on when you know how many base/jukto units are in the word. "
+                "For a single character or single jukto borno, set the count to 1."
+            )
+        )
+
+        expected_count = st.number_input(
+            "Expected number of base/jukto units",
+            min_value=1,
+            max_value=10,
+            value=1,
+            step=1,
+            help=(
+                "Single character = 1. "
+                "ওজন = 3 units: ও + জ + ন. "
+                "ক্ষমা = 2 units if ignoring আ-কার: ক্ষ + ম."
+            )
+        )
+
         st.header("Drawing Tips")
-        st.write("- Draw clearly using black stroke.")
-        st.write("- Keep small spacing between characters.")
-        st.write("- Draw larger if segmentation fails.")
-        st.write("- For connected Bangla words, segmentation may be imperfect.")
+        st.write("- For a single character, set expected count to 1.")
+        st.write("- For a single jukto borno, set expected count to 1.")
+        st.write("- For ওজন, set expected count to 3: ও + জ + ন.")
+        st.write("- For ক্ষমা, set expected count to 2: ক্ষ + ম, ignoring আ-কার.")
+        st.write("- Count jukto borno as one unit if it exists in the trained classes.")
+        st.write("- Do not count কার চিহ্ন separately.")
+        st.write("- Keep slight spacing between base/jukto units for word recognition.")
+        st.write("- Fully connected handwriting may still be difficult without a word-level OCR model.")
         st.write("- Refresh the page to clear the canvas.")
 
     col1, col2 = st.columns([2, 1])
@@ -216,38 +574,49 @@ def main():
             key="canvas"
         )
 
-        recognize_button = st.button("Recognize Word", type="primary")
+        recognize_button = st.button("Recognize", type="primary")
 
     with col2:
         st.subheader("Output")
         st.write("The app will display:")
-        st.write("1. Segmented character images")
-        st.write("2. Bangla character output")
-        st.write("3. Dataset class sequence")
-        st.write("4. Per-character confidence scores")
-        st.write("5. Top-3 predictions")
+        st.write("1. Preprocessed binary image")
+        st.write("2. Segmented base/jukto unit images")
+        st.write("3. Bangla output")
+        st.write("4. Dataset class sequence")
+        st.write("5. Per-unit confidence scores")
+        st.write("6. Top-3 predictions")
 
     if recognize_button:
         if canvas_result.image_data is None:
-            st.warning("Please draw a Bangla word or character first.")
+            st.warning("Please draw a Bangla character, jukto borno, or word first.")
             return
 
         canvas_image = canvas_result.image_data.astype(np.uint8)
 
-        character_images, boxes, binary_image = segment_characters(canvas_image)
+        character_images, boxes, binary_image = segment_characters(
+            canvas_image,
+            expected_count=expected_count,
+            use_expected_count=use_expected_count
+        )
 
         if len(character_images) == 0:
-            st.warning("No character detected. Please draw larger and darker characters.")
+            st.warning("No character detected. Please draw larger and darker.")
             return
 
         st.subheader("Preprocessed Canvas")
         st.image(binary_image, caption="Binary image after preprocessing", width=500)
 
-        predicted_class_sequence = ""
+        if use_expected_count and len(character_images) != expected_count:
+            st.warning(
+                f"Expected {expected_count} base/jukto unit(s), but safely detected "
+                f"{len(character_images)}. The app avoided unsafe cuts through connected characters."
+            )
+
+        predicted_class_sequence = []
         predicted_bangla_sequence = ""
         prediction_rows = []
 
-        st.subheader("Segmented Characters")
+        st.subheader("Segmented Base/Jukto Units")
 
         preview_columns = st.columns(min(len(character_images), 6))
 
@@ -264,11 +633,11 @@ def main():
 
             class_id, bangla_character, confidence, top_predictions = prediction_result
 
-            predicted_class_sequence += str(class_id)
+            predicted_class_sequence.append(str(class_id))
             predicted_bangla_sequence += str(bangla_character)
 
             prediction_rows.append({
-                "Character No.": index + 1,
+                "Unit No.": index + 1,
                 "Bangla Prediction": bangla_character,
                 "Dataset Class ID": class_id,
                 "Confidence": f"{confidence:.2%}",
@@ -283,25 +652,26 @@ def main():
             with preview_columns[index % len(preview_columns)]:
                 st.image(
                     character_image,
-                    caption=f"Char {index + 1}: {bangla_character}",
+                    caption=f"Unit {index + 1}: {bangla_character}",
                     width=110
                 )
 
-        st.subheader("Recognized Bangla Word / Character Sequence")
+        st.subheader("Recognized Bangla Output")
 
         st.write("Bangla Output:")
         st.success(predicted_bangla_sequence)
 
         st.write("Predicted Dataset Class Sequence:")
-        st.info(predicted_class_sequence)
+        st.info(" → ".join(predicted_class_sequence))
 
         st.subheader("Confidence Scores")
         st.dataframe(prediction_rows, use_container_width=True)
 
         st.info(
-            "Note: The model was trained on isolated Bangla character images. "
-            "Word recognition is performed by segmenting the drawn word into "
-            "characters and predicting each character separately."
+            "Note: The model was trained on isolated Bangla characters and selected "
+            "jukto borno classes. The app uses matra-aware safe segmentation and removes "
+            "headline-only fragments. It does not separately recognize কার চিহ্ন as "
+            "independent symbols."
         )
 
 
